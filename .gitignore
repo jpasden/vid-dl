@@ -1,6 +1,10 @@
 # Downloaded media (if the fallback local downloads/ folder is ever used)
 downloads/
 
+# Exported browser cookies. These are live account credentials for your
+# signed-in YouTube session -- never commit them.
+.cookies.txt
+
 # Python
 __pycache__/
 *.pyc

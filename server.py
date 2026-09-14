@@ -34,7 +34,8 @@ FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None
 # blocks anonymous requests with "Sign in to confirm you're not a bot". We
 # detect a usable runtime (yt-dlp only enables deno by default) and pass the
 # user's browser cookies to get past the bot check.
-JS_RUNTIMES = ("deno", "node", "bun")
+# Same order yt-dlp itself prioritises them (see `yt-dlp --js-runtimes`).
+JS_RUNTIMES = ("deno", "node", "quickjs", "bun")
 
 
 def detect_js_runtime():
@@ -69,6 +70,47 @@ def detect_cookie_browser():
 JS_RUNTIME = detect_js_runtime()
 COOKIE_BROWSER = detect_cookie_browser()
 
+# Reading cookies straight from Chrome means asking macOS for the browser's
+# Keychain encryption key, which pops a password prompt -- twice per download,
+# since yt-dlp fetches the video and audio streams as separate passes. So we
+# export once to a plain cookie file and reuse it. Only a re-export touches
+# the Keychain again, and that only happens when the cookies stop working
+# (signing out of YouTube or changing your Google password invalidates them;
+# the auth cookies themselves carry far-future expiry dates).
+COOKIE_FILE = os.path.join(SCRIPT_DIR, ".cookies.txt")
+
+
+def export_cookies():
+    """Export browser cookies to COOKIE_FILE. Returns True on success.
+
+    This is the one operation that can prompt for the login password.
+    """
+    if not COOKIE_BROWSER:
+        return False
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "yt_dlp",
+             "--cookies-from-browser", COOKIE_BROWSER,
+             "--cookies", COOKIE_FILE,
+             "--skip-download", "--simulate", "--quiet",
+             "https://www.youtube.com/watch?v=BaW_jenozKc"],
+            capture_output=True, text=True, timeout=120,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    if os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0:
+        # Cookies are account credentials -- keep them owner-readable only.
+        try:
+            os.chmod(COOKIE_FILE, 0o600)
+        except OSError:
+            pass
+        return True
+    return proc.returncode == 0
+
+
+def have_cookie_file():
+    return os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0
+
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 
@@ -88,7 +130,11 @@ def build_command(url, mode, quality=DEFAULT_QUALITY, subs=False):
         # the runtime needs to answer YouTube's "n challenge". Without it the
         # extraction fails with "The page needs to be reloaded."
         base += ["--js-runtimes", JS_RUNTIME, "--remote-components", "ejs:github"]
-    if COOKIE_BROWSER:
+    # Prefer the exported file: it needs no Keychain access, so no password
+    # prompt. Fall back to reading the browser directly if it's missing.
+    if have_cookie_file():
+        base += ["--cookies", COOKIE_FILE]
+    elif COOKIE_BROWSER:
         base += ["--cookies-from-browser", COOKIE_BROWSER]
     outtmpl = os.path.join(DEFAULT_OUTPUT_DIR, "%(title)s.%(ext)s")
     if mode == "audio":
@@ -161,6 +207,39 @@ def explain_failure(log):
     return "yt-dlp exited with an error. See log for details."
 
 
+def cookies_look_stale(log):
+    """True if the failure looks like rejected/expired cookies."""
+    text = "\n".join(log)
+    return ("Sign in to confirm" in text or "not a bot" in text
+            or "cookies are no longer valid" in text)
+
+
+def run_ytdlp(job, cmd):
+    """Run yt-dlp, streaming progress into `job`. Returns the exit code."""
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, cwd=DEFAULT_OUTPUT_DIR,
+    )
+    job["pid"] = proc.pid
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        job["log"].append(line)
+        job["log"] = job["log"][-80:]
+        m = PERCENT_RE.search(line)
+        if m:
+            job["percent"] = float(m.group(1))
+        s = SIZE_RE.search(line)
+        if s:
+            job["size"] = s.group(1).strip()
+        d = DEST_RE.search(line)
+        if d:
+            job["filename"] = os.path.basename(d.group(1))
+    proc.wait()
+    return proc.returncode
+
+
 def run_job(job_id, url, mode, quality=DEFAULT_QUALITY, subs=False):
     job = JOBS[job_id]
 
@@ -179,31 +258,22 @@ def run_job(job_id, url, mode, quality=DEFAULT_QUALITY, subs=False):
             ".srt. Install ffmpeg for automatic conversion.)"
         )
 
-    cmd = build_command(url, mode, quality, subs)
     job["status"] = "running"
     try:
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, cwd=DEFAULT_OUTPUT_DIR,
-        )
-        job["pid"] = proc.pid
-        for line in proc.stdout:
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            job["log"].append(line)
-            job["log"] = job["log"][-80:]
-            m = PERCENT_RE.search(line)
-            if m:
-                job["percent"] = float(m.group(1))
-            s = SIZE_RE.search(line)
-            if s:
-                job["size"] = s.group(1).strip()
-            d = DEST_RE.search(line)
-            if d:
-                job["filename"] = os.path.basename(d.group(1))
-        proc.wait()
-        if proc.returncode == 0:
+        rc = run_ytdlp(job, build_command(url, mode, quality, subs))
+        if rc != 0 and cookies_look_stale(job["log"]) and COOKIE_BROWSER:
+            # The saved cookies stopped working -- usually because you signed
+            # out of YouTube or changed your password. Refresh them once and
+            # retry, so the only password prompt happens when it's genuinely
+            # needed rather than on every download.
+            job["log"].append(
+                "(Saved cookies were rejected - refreshing them from "
+                f"{COOKIE_BROWSER.title()}. macOS may ask for your password.)"
+            )
+            job["percent"] = 0
+            if export_cookies():
+                rc = run_ytdlp(job, build_command(url, mode, quality, subs))
+        if rc == 0:
             job["status"] = "done"
             job["percent"] = 100
         else:
@@ -262,6 +332,7 @@ class Handler(BaseHTTPRequestHandler):
                 "default_quality": DEFAULT_QUALITY,
                 "js_runtime": JS_RUNTIME,
                 "cookie_browser": COOKIE_BROWSER,
+                "cookies_saved": have_cookie_file(),
             })
         elif parsed.path == "/api/open-folder":
             try:

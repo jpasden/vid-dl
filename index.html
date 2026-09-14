@@ -170,6 +170,24 @@
     border-radius: 4px;
     font-size: 11px;
   }
+  .notice {
+    margin-top: 14px;
+    font-size: 12px;
+    background: rgba(77,171,247,0.07);
+    border: 1px solid rgba(77,171,247,0.3);
+    color: #b8d8f5;
+    padding: 10px 12px;
+    border-radius: 8px;
+    line-height: 1.5;
+    display: none;
+  }
+  .notice strong { color: var(--text); }
+  .notice code {
+    background: rgba(0,0,0,0.25);
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 11px;
+  }
 </style>
 </head>
 <body>
@@ -203,6 +221,7 @@
     <button class="go" id="goBtn">Download</button>
 
     <div class="warn" id="ffmpegWarn"></div>
+    <div class="notice" id="cookieNotice"></div>
 
     <div class="status-block" id="statusBlock" style="display:none;">
       <div class="progress-outer"><div class="progress-inner" id="progressInner"></div></div>
@@ -245,6 +264,30 @@ fetch("/api/info").then(r => r.json()).then(info => {
   document.getElementById("saveLoc").textContent = "Saving to " + info.output_dir;
   if (info.default_quality) {
     qualitySelect.value = info.default_quality;
+  }
+  // Explain the macOS password prompt BEFORE it appears — an unexplained
+  // system password dialog is alarming and easy to mistake for malware.
+  const note = document.getElementById("cookieNotice");
+  const browser = info.cookie_browser
+    ? info.cookie_browser.charAt(0).toUpperCase() + info.cookie_browser.slice(1)
+    : null;
+  if (browser && !info.cookies_saved) {
+    note.style.display = "block";
+    note.innerHTML =
+      "<strong>Heads up: macOS will ask for your password on the first download.</strong><br>" +
+      "YouTube blocks anonymous downloads, so this app reads your " + browser +
+      " YouTube cookies to prove you're a real signed-in person. Those cookies are " +
+      "encrypted by macOS, so it asks permission before handing them over — " +
+      "that's the standard Keychain prompt, and it's your Mac login password, " +
+      "not an admin install.<br><br>" +
+      "It's saved locally after that, so you shouldn't be asked again unless you " +
+      "sign out of YouTube or change your Google password.";
+  } else if (browser && info.cookies_saved) {
+    note.style.display = "block";
+    note.innerHTML =
+      "Using your saved " + browser + " YouTube cookies — no password prompt needed. " +
+      "If you sign out of YouTube or change your Google password, they'll be " +
+      "refreshed automatically and macOS will ask once more.";
   }
   if (!info.ffmpeg_available) {
     const w = document.getElementById("ffmpegWarn");
