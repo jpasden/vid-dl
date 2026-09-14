@@ -22,6 +22,14 @@ This repository does **not** include or redistribute yt-dlp itself. It is downlo
 ## Requirements
 
 - **macOS** with **Python 3** (already included on modern macOS; otherwise install from [python.org](https://www.python.org/downloads/))
+- **A JavaScript runtime** — **required** for YouTube downloads. YouTube now
+  needs one to read its player and to pass its bot check; without it downloads
+  fail with "Sign in to confirm you're not a bot."
+  - Install with Homebrew: `brew install deno` (Node.js or Bun also work if you
+    already have either — the app detects whichever is present)
+- **A signed-in browser** — Chrome, Brave, Edge, Firefox, or Safari. The app
+  reads its YouTube cookies automatically to get past the bot check. Sign in to
+  YouTube in that browser once; nothing else to configure.
 - **[ffmpeg](https://ffmpeg.org)** — optional but recommended. Needed for MP3 extraction and for merging separate video/audio streams into the best-quality MP4. Without it, video quality is capped to formats that don't require merging, and MP3 downloads won't work.
   - Install with Homebrew: `brew install ffmpeg` (get Homebrew first at [brew.sh](https://brew.sh) if you don't have it)
 - **yt-dlp** — installed automatically the first time you run the app. You don't need to install it yourself.

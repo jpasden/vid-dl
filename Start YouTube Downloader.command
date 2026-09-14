@@ -39,6 +39,21 @@ else
   fi
 fi
 
+# --- Check for a JavaScript runtime (YouTube now requires one) ---
+if ! command -v deno >/dev/null 2>&1 \
+  && ! command -v node >/dev/null 2>&1 \
+  && ! command -v bun >/dev/null 2>&1; then
+  echo ""
+  echo "NOTE: no JavaScript runtime found."
+  echo "  YouTube now requires one to read its player, so downloads will fail"
+  echo "  with a 'Sign in to confirm you're not a bot' or 'no supported"
+  echo "  JavaScript runtime' error until you install one."
+  echo ""
+  echo "  Install it with:  brew install deno"
+  echo "  (Node.js or Bun work too, if you already have either.)"
+  echo ""
+fi
+
 # --- Check for ffmpeg (needed for best-quality MP4 merging and all MP3 downloads) ---
 if ! command -v ffmpeg >/dev/null 2>&1; then
   echo ""

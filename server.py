@@ -30,6 +30,45 @@ os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
 
 FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None
 
+# YouTube now requires a JavaScript runtime to decrypt player responses, and
+# blocks anonymous requests with "Sign in to confirm you're not a bot". We
+# detect a usable runtime (yt-dlp only enables deno by default) and pass the
+# user's browser cookies to get past the bot check.
+JS_RUNTIMES = ("deno", "node", "bun")
+
+
+def detect_js_runtime():
+    for name in JS_RUNTIMES:
+        if shutil.which(name):
+            return name
+    return None
+
+
+# Browsers yt-dlp can pull cookies from, in the order we try them. A browser
+# that's installed but was never used for YouTube just yields no useful
+# cookies, so the download still falls back to an anonymous attempt.
+COOKIE_BROWSERS = ("chrome", "brave", "edge", "firefox", "safari")
+BROWSER_APP_PATHS = {
+    "chrome": "Google Chrome.app",
+    "brave": "Brave Browser.app",
+    "edge": "Microsoft Edge.app",
+    "firefox": "Firefox.app",
+    "safari": "Safari.app",
+}
+
+
+def detect_cookie_browser():
+    for name in COOKIE_BROWSERS:
+        app = BROWSER_APP_PATHS[name]
+        for base in ("/Applications", os.path.join(HOME, "Applications")):
+            if os.path.exists(os.path.join(base, app)):
+                return name
+    return None
+
+
+JS_RUNTIME = detect_js_runtime()
+COOKIE_BROWSER = detect_cookie_browser()
+
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 
@@ -44,6 +83,13 @@ VALID_QUALITIES = {"best", "2160", "1440", "1080", "720", "480"}
 
 def build_command(url, mode, quality=DEFAULT_QUALITY, subs=False):
     base = [sys.executable, "-m", "yt_dlp", "--newline", "--no-playlist"]
+    if JS_RUNTIME:
+        # --remote-components fetches yt-dlp's challenge solver script, which
+        # the runtime needs to answer YouTube's "n challenge". Without it the
+        # extraction fails with "The page needs to be reloaded."
+        base += ["--js-runtimes", JS_RUNTIME, "--remote-components", "ejs:github"]
+    if COOKIE_BROWSER:
+        base += ["--cookies-from-browser", COOKIE_BROWSER]
     outtmpl = os.path.join(DEFAULT_OUTPUT_DIR, "%(title)s.%(ext)s")
     if mode == "audio":
         base += ["-x", "--audio-format", "mp3"]
@@ -62,11 +108,57 @@ def build_command(url, mode, quality=DEFAULT_QUALITY, subs=False):
             # if that's all the video has. Saved as a separate .srt file
             # next to the video (converted from YouTube's vtt when ffmpeg
             # is available; left as .vtt otherwise).
-            base += ["--write-subs", "--write-auto-subs", "--sub-langs", "en.*"]
+            # "en.*" alone also matches en-orig and en-en, littering the
+            # folder with near-identical files. Excluding those variants
+            # leaves the single .srt the UI promises.
+            base += ["--write-subs", "--write-auto-subs",
+                     "--sub-langs", "en.*,-en-orig,-en-en"]
             if FFMPEG_AVAILABLE:
                 base += ["--convert-subs", "srt"]
     base += ["-o", outtmpl, url]
     return base
+
+
+def explain_failure(log):
+    """Turn yt-dlp's raw output into a plain-English cause and fix.
+
+    The generic "see log for details" hides the two failures that actually
+    happen in practice: a missing JS runtime and YouTube's bot check.
+    """
+    text = "\n".join(log)
+    if "Sign in to confirm" in text or "not a bot" in text:
+        if COOKIE_BROWSER:
+            return (
+                f"YouTube blocked the request as a suspected bot, even using your "
+                f"{COOKIE_BROWSER.title()} cookies. Open YouTube in {COOKIE_BROWSER.title()}, "
+                "make sure you're signed in and can play the video, then try again."
+            )
+        return (
+            "YouTube blocked the request as a suspected bot. This is fixed by "
+            "sending your browser's cookies, but no supported browser was found. "
+            "Install Chrome, Brave, Edge, Firefox, or Safari, sign in to YouTube "
+            "there, then restart the downloader."
+        )
+    if "page needs to be reloaded" in text or "challenge solving failed" in text:
+        return (
+            "YouTube's player challenge couldn't be solved, so no downloadable "
+            "formats were found. This usually clears up on its own — try again, "
+            "and if it persists, relaunch to pick up the latest yt-dlp."
+        )
+    if "No supported JavaScript runtime" in text:
+        return (
+            "YouTube now needs a JavaScript runtime and none was found. "
+            "Install one with: brew install deno (then relaunch the downloader)."
+        )
+    if "Video unavailable" in text or "private video" in text.lower():
+        return "That video is unavailable, private, or removed."
+    if "is not a valid URL" in text or "Unsupported URL" in text:
+        return "That doesn't look like a valid video URL."
+    # Fall back to yt-dlp's own last ERROR line, which beats a generic message.
+    for line in reversed(log):
+        if line.startswith("ERROR:"):
+            return line[len("ERROR:"):].strip()
+    return "yt-dlp exited with an error. See log for details."
 
 
 def run_job(job_id, url, mode, quality=DEFAULT_QUALITY, subs=False):
@@ -116,7 +208,7 @@ def run_job(job_id, url, mode, quality=DEFAULT_QUALITY, subs=False):
             job["percent"] = 100
         else:
             job["status"] = "error"
-            job["error"] = "yt-dlp exited with an error. See log for details."
+            job["error"] = explain_failure(job["log"])
     except FileNotFoundError:
         job["status"] = "error"
         job["error"] = "yt-dlp isn't installed. Re-run the launcher to install it."
@@ -168,6 +260,8 @@ class Handler(BaseHTTPRequestHandler):
                 "output_dir": DEFAULT_OUTPUT_DIR,
                 "ffmpeg_available": FFMPEG_AVAILABLE,
                 "default_quality": DEFAULT_QUALITY,
+                "js_runtime": JS_RUNTIME,
+                "cookie_browser": COOKIE_BROWSER,
             })
         elif parsed.path == "/api/open-folder":
             try:
@@ -220,6 +314,16 @@ def main():
     if not FFMPEG_AVAILABLE:
         print("NOTE: ffmpeg not found - video quality will be limited and MP3 "
               "extraction will not work. Install with: brew install ffmpeg")
+    if JS_RUNTIME:
+        print(f"JavaScript runtime: {JS_RUNTIME}")
+    else:
+        print("NOTE: no JavaScript runtime found - YouTube downloads will fail. "
+              "Install one with: brew install deno")
+    if COOKIE_BROWSER:
+        print(f"Using cookies from: {COOKIE_BROWSER}")
+    else:
+        print("NOTE: no supported browser found for cookies - YouTube may block "
+              "downloads with a bot check.")
     threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
         server.serve_forever()
