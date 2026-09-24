@@ -208,8 +208,8 @@
       <option value="best">Best available</option>
       <option value="2160">2160p (4K)</option>
       <option value="1440">1440p (2K)</option>
-      <option value="1080" selected>1080p (Full HD)</option>
-      <option value="720">720p (HD)</option>
+      <option value="1080">1080p (Full HD)</option>
+      <option value="720" selected>720p (HD)</option>
       <option value="480">480p (SD)</option>
     </select>
 
@@ -271,7 +271,23 @@ fetch("/api/info").then(r => r.json()).then(info => {
   const browser = info.cookie_browser
     ? info.cookie_browser.charAt(0).toUpperCase() + info.cookie_browser.slice(1)
     : null;
-  if (browser && !info.cookies_saved) {
+  if (info.cookies_blocked && !info.cookies_saved) {
+    // macOS is blocking the cookie store. Say so up front, and say plainly
+    // that the password prompt won't help — otherwise people retype it.
+    note.style.display = "block";
+    note.style.background = "rgba(255,212,59,0.08)";
+    note.style.borderColor = "rgba(255,212,59,0.35)";
+    note.innerHTML =
+      "<strong>macOS is blocking access to your " + browser + " cookies.</strong><br>" +
+      "Downloads will fail with a \"not a bot\" error until this is fixed, and " +
+      "<strong>entering your password won't help</strong> — it isn't a password problem.<br><br>" +
+      "Fix it once:<br>" +
+      "1. <strong>System Settings > Privacy &amp; Security > Full Disk Access</strong><br>" +
+      "2. Turn on <strong>Terminal</strong> (click + and add it from " +
+      "Applications/Utilities if it's not listed)<br>" +
+      "3. Quit Terminal fully (<code>Cmd-Q</code>) and relaunch the downloader<br><br>" +
+      "A macOS upgrade resets this, which is why it stopped working.";
+  } else if (browser && !info.cookies_saved) {
     note.style.display = "block";
     note.innerHTML =
       "<strong>Heads up: macOS will ask for your password on the first download.</strong><br>" +

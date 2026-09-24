@@ -80,36 +80,91 @@ COOKIE_BROWSER = detect_cookie_browser()
 COOKIE_FILE = os.path.join(SCRIPT_DIR, ".cookies.txt")
 
 
+# The cookies that actually prove you're signed in. An export missing these
+# is useless for getting past the bot check, however many other cookies it
+# picked up, so we check for them before trusting a new file.
+AUTH_COOKIES = ("SID", "__Secure-1PSID", "SAPISID", "LOGIN_INFO")
+
+
+def cookie_file_is_usable(path):
+    """True if `path` holds a YouTube cookie jar with real auth cookies."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            names = {
+                parts[5]
+                for line in f
+                if line.strip() and not line.startswith("#")
+                and len(parts := line.split("\t")) > 5
+                and "youtube" in parts[0]
+            }
+    except OSError:
+        return False
+    return bool(names & set(AUTH_COOKIES))
+
+
 def export_cookies():
     """Export browser cookies to COOKIE_FILE. Returns True on success.
 
     This is the one operation that can prompt for the login password.
+
+    Writes to a temp file and only replaces COOKIE_FILE once the result is
+    verified usable. macOS can hand over the Keychain key and *still* block
+    reading the browser's cookie database (a privacy restriction that a
+    system upgrade silently re-arms), which yields a technically-valid file
+    with no auth cookies in it. Overwriting a good jar with that turns a
+    working setup into a broken one -- and no amount of retyping the
+    password fixes it, because the password was never the problem.
     """
     if not COOKIE_BROWSER:
         return False
+    tmp = COOKIE_FILE + ".new"
     try:
-        proc = subprocess.run(
+        subprocess.run(
             [sys.executable, "-m", "yt_dlp",
              "--cookies-from-browser", COOKIE_BROWSER,
-             "--cookies", COOKIE_FILE,
+             "--cookies", tmp,
              "--skip-download", "--simulate", "--quiet",
              "https://www.youtube.com/watch?v=BaW_jenozKc"],
             capture_output=True, text=True, timeout=120,
         )
     except (subprocess.SubprocessError, OSError):
-        return False
-    if os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0:
-        # Cookies are account credentials -- keep them owner-readable only.
-        try:
-            os.chmod(COOKIE_FILE, 0o600)
-        except OSError:
-            pass
+        pass
+    try:
+        if os.path.exists(tmp) and cookie_file_is_usable(tmp):
+            os.chmod(tmp, 0o600)  # account credentials: owner-only
+            os.replace(tmp, COOKIE_FILE)
+            return True
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return False
+
+
+def browser_cookies_readable():
+    """True if the browser's cookie store isn't blocked by macOS privacy.
+
+    Chrome and friends keep cookies under ~/Library/Application Support,
+    which macOS guards with Full Disk Access.
+    """
+    paths = {
+        "chrome": "Google/Chrome",
+        "brave": "BraveSoftware/Brave-Browser",
+        "edge": "Microsoft Edge",
+        "firefox": "Firefox",
+        "safari": None,  # Safari uses a different store; let yt-dlp try.
+    }
+    rel = paths.get(COOKIE_BROWSER)
+    if not rel:
         return True
-    return proc.returncode == 0
+    try:
+        os.listdir(os.path.join(HOME, "Library", "Application Support", rel))
+        return True
+    except OSError:
+        return False
 
 
 def have_cookie_file():
-    return os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0
+    return os.path.exists(COOKIE_FILE) and cookie_file_is_usable(COOKIE_FILE)
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
@@ -119,7 +174,7 @@ DEST_RE = re.compile(r"(?:Destination|Merging formats into):?\s*\"?([^\"\n]+)\"?
 SIZE_RE = re.compile(r"\[download\]\s+[\d.]+%\s+of\s+~?\s*([\d.]+\s?\S+?)(?:\s+at\s|\s+in\s|\s*$)")
 
 # Default max resolution for video downloads when the user doesn't pick one.
-DEFAULT_QUALITY = "1080"
+DEFAULT_QUALITY = "720"
 VALID_QUALITIES = {"best", "2160", "1440", "1080", "720", "480"}
 
 
@@ -165,6 +220,22 @@ def build_command(url, mode, quality=DEFAULT_QUALITY, subs=False):
     return base
 
 
+def macos_permission_help():
+    """Message for when macOS is blocking access to the browser's cookies."""
+    browser = (COOKIE_BROWSER or "your browser").title()
+    return (
+        f"macOS is blocking access to your {browser} cookies, so YouTube sees "
+        "an anonymous request and refuses. Entering your password again will "
+        "NOT fix this — the password isn't the problem.\n\n"
+        "Grant Terminal permission instead:\n"
+        "1. System Settings > Privacy & Security > Full Disk Access\n"
+        "2. Turn on Terminal (click + and add it from Applications/Utilities "
+        "if it isn't listed)\n"
+        "3. Quit Terminal completely (Cmd-Q) and relaunch the downloader\n\n"
+        "A macOS upgrade usually resets this, which is why it worked before."
+    )
+
+
 def explain_failure(log):
     """Turn yt-dlp's raw output into a plain-English cause and fix.
 
@@ -172,7 +243,13 @@ def explain_failure(log):
     happen in practice: a missing JS runtime and YouTube's bot check.
     """
     text = "\n".join(log)
+    if "could not find" in text and "cookies database" in text:
+        return macos_permission_help()
     if "Sign in to confirm" in text or "not a bot" in text:
+        # Blocked cookie access is the usual cause, and it is NOT fixed by
+        # re-entering the password -- say so before the user tries.
+        if COOKIE_BROWSER and not browser_cookies_readable():
+            return macos_permission_help()
         if COOKIE_BROWSER:
             return (
                 f"YouTube blocked the request as a suspected bot, even using your "
@@ -261,7 +338,11 @@ def run_job(job_id, url, mode, quality=DEFAULT_QUALITY, subs=False):
     job["status"] = "running"
     try:
         rc = run_ytdlp(job, build_command(url, mode, quality, subs))
-        if rc != 0 and cookies_look_stale(job["log"]) and COOKIE_BROWSER:
+        # Don't retry when macOS is blocking the cookie store: the re-export
+        # can't succeed, and each attempt throws another password prompt at
+        # someone whose password was never the problem.
+        if (rc != 0 and cookies_look_stale(job["log"]) and COOKIE_BROWSER
+                and browser_cookies_readable()):
             # The saved cookies stopped working -- usually because you signed
             # out of YouTube or changed your password. Refresh them once and
             # retry, so the only password prompt happens when it's genuinely
@@ -333,6 +414,7 @@ class Handler(BaseHTTPRequestHandler):
                 "js_runtime": JS_RUNTIME,
                 "cookie_browser": COOKIE_BROWSER,
                 "cookies_saved": have_cookie_file(),
+                "cookies_blocked": bool(COOKIE_BROWSER) and not browser_cookies_readable(),
             })
         elif parsed.path == "/api/open-folder":
             try:
