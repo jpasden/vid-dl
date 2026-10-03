@@ -146,6 +146,52 @@ fail with the bot-check error for the rest.
 7. Files are saved to `~/Downloads/YT` by default — click **"Open downloads folder"** to jump there.
 8. When you're done, close the Terminal window (or press `Ctrl+C` in it) to stop the app.
 
+## Convert downloads for Xiaomi TV
+
+[`xm-convert.sh`](xm-convert.sh) is an optional, standalone terminal helper for
+preparing downloaded MP4s for Xiaomi TV playback. It runs HandBrake's
+`Fast 1080p30` preset and saves converted copies in a `xiaomitv` subfolder,
+leaving the original videos untouched. It runs separately from the web app.
+
+You need **Bash** (macOS's built-in Bash works) and **HandBrakeCLI** available
+on your `PATH`. The HandBrake desktop app alone is not enough. With Homebrew,
+install the command-line tool using `brew install handbrake`.
+
+Run it **from the folder containing your videos**. For the default download
+folder and a repository at `~/Code/vid-dl`:
+
+```bash
+cd ~/Downloads/YT
+bash ~/Code/vid-dl/xm-convert.sh
+```
+
+Alternatively, copy `xm-convert.sh` into that folder and run
+`bash ./xm-convert.sh`. The script always uses the current working directory,
+not the directory where the script itself lives. It processes only `*.mp4`
+files directly in that folder, without searching subfolders.
+
+- A matching `.srt` file (for example, `lesson.srt` beside `lesson.mp4`) is
+  included as a selectable UTF-8 subtitle track, without burning it into the video.
+- If `xiaomitv` already contains a file with the same name, the script keeps it
+  and prints a compact skip notice. This is a filename check, not a content or
+  integrity check. To reconvert a file, move its existing output out of `xiaomitv`.
+- New conversions show their source, destination, subtitles, and encoding
+  progress bar. Overall batch progress is a plain `29/30 files handled` count;
+  skipped and failed files count as handled too.
+- **Ctrl-C stops the entire batch**, including the active encoder. Finished
+  videos remain in place; the temporary in-progress output is removed. Run the
+  same command again to skip completed videos and continue with the rest.
+- An ordinary conversion failure produces a short notice and the path to a
+  full diagnostic log in the system temporary directory, then processing
+  continues with the next file. Failed output is removed so it can be retried.
+
+The final summary reports converted, skipped, and failed counts, elapsed time,
+and the destination folder. Colors are enabled in a supported terminal;
+`NO_COLOR=1 bash ~/Code/vid-dl/xm-convert.sh` disables them. Redirected output
+uses plain progress lines instead of terminal redraws. The exit status is `0`
+when all files were converted or skipped (including an empty folder), `1` for
+conversion failures, and `130` when the batch is canceled.
+
 ## How it works
 
 `server.py` is a small Python script (standard library only, no extra dependencies) that runs a local web server, wraps the `yt-dlp` command-line tool, and serves the front end in `index.html`. Everything runs locally on your machine — no data is sent anywhere except to YouTube itself to fetch the video you asked for.
