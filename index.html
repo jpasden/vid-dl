@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <title>YouTube Downloader</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <style>
   :root {
     --bg: #0f1115;
@@ -110,7 +111,9 @@
     cursor: pointer;
     transition: filter .15s;
   }
-  button.go:hover { filter: brightness(1.08); }
+  .video-title { margin: 12px 0 0; font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; }
+  .video-title.pending { color: var(--muted); }
+  button.go:not(:disabled):hover { filter: brightness(1.08); }
   button.go:disabled { background: #3a3d45; cursor: not-allowed; }
   .status-block { margin-top: 22px; }
   .progress-outer {
@@ -218,13 +221,13 @@
       <label for="subs">Download English subtitles (.srt) if available</label>
     </div>
 
-    <button class="go" id="goBtn">Download</button>
+    <button class="go" id="goBtn" disabled>Download</button>
+    <p id="videoTitle" class="video-title" aria-live="polite" hidden></p>
 
     <div class="warn" id="ffmpegWarn"></div>
-    <div class="notice" id="cookieNotice"></div>
 
     <div class="status-block" id="statusBlock" style="display:none;">
-      <div class="progress-outer"><div class="progress-inner" id="progressInner"></div></div>
+      <div class="progress-outer" role="progressbar" aria-label="Download progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progressBar"><div class="progress-inner" id="progressInner"></div></div>
       <div class="status-line">
         <span class="state" id="stateText">Starting…</span>
         <span id="percentText">0%</span>
@@ -240,6 +243,7 @@
       <span id="saveLoc">Saving to …</span>
       <a id="openFolder">Open downloads folder</a>
     </div>
+    <div class="notice" id="cookieNotice"></div>
   </div>
 
 <script>
@@ -319,80 +323,128 @@ document.getElementById("openFolder").addEventListener("click", () => {
   fetch("/api/open-folder");
 });
 
-document.getElementById("goBtn").addEventListener("click", startDownload);
-document.getElementById("url").addEventListener("keydown", e => {
-  if (e.key === "Enter") startDownload();
-});
-
-function startDownload() {
-  const url = document.getElementById("url").value.trim();
-  if (!url) return;
-  const btn = document.getElementById("goBtn");
-  btn.disabled = true;
-  btn.textContent = "Working…";
-  document.getElementById("statusBlock").style.display = "block";
-  setState("starting", 0, [], null, null, null);
-
-  fetch("/api/download", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      url, mode,
-      quality: qualitySelect.value,
-      subs: mode === "video" ? subsCheckbox.checked : false
-    })
-  }).then(r => r.json()).then(data => {
-    if (data.error) {
-      setState("error", 0, [data.error], data.error);
-      resetBtn();
-      return;
-    }
-    poll(data.id);
-  }).catch(err => {
-    setState("error", 0, [String(err)],
-      "Couldn't reach the downloader server. Try quitting and relaunching " +
-      "'Start YouTube Downloader.command', then reload this page.");
-    resetBtn();
-  });
-}
-
+const goBtn = document.getElementById("goBtn");
+const urlInput = document.getElementById("url");
+const videoTitle = document.getElementById("videoTitle");
+let submittedUrl = null;
+let active = false;
+let completedAt = null;
+let completionTimer = null;
+let displayedPercent = 0;
 let pollFailCount = 0;
 let stalledSince = null;
 
-function poll(id) {
-  clearInterval(pollTimer);
-  pollFailCount = 0;
-  stalledSince = Date.now();
-  pollTimer = setInterval(() => {
-    fetch("/api/status?id=" + id).then(r => r.json()).then(job => {
-      pollFailCount = 0;
-      if (job.status !== "starting") stalledSince = Date.now();
-      let log = job.log || [];
-      if (job.status === "starting" && Date.now() - stalledSince > 15000) {
-        log = log.concat(["(Still starting after 15s — the URL may be invalid, " +
-          "or the server may need a restart. Feel free to try again or relaunch " +
-          "'Start YouTube Downloader.command'.)"]);
-      }
-      setState(job.status, job.percent || 0, log, job.error, job.filename, job.size);
-      if (job.status === "done" || job.status === "error") {
-        clearInterval(pollTimer);
-        resetBtn();
-      }
-    }).catch(() => {
-      pollFailCount += 1;
-      if (pollFailCount >= 3) {
-        clearInterval(pollTimer);
-        setState("error", 0, ["Lost connection to the downloader server."],
-          "Lost connection to the server. Try relaunching 'Start YouTube Downloader.command'.");
-        resetBtn();
-      }
-    });
-  }, 800);
+function updateButton() {
+  const url = urlInput.value.trim();
+  const sameUrl = url === submittedUrl;
+  goBtn.disabled = active || !url || sameUrl;
+  if (active) {
+    goBtn.textContent = "Downloading…";
+  } else if (sameUrl && completedAt !== null) {
+    const seconds = Math.max(0, Math.floor((Date.now() - completedAt) / 1000));
+    const minutes = Math.floor(seconds / 60);
+    const elapsed = minutes + ":" + String(seconds % 60).padStart(2, "0");
+    goBtn.textContent = "Completed · " + elapsed + " ago";
+  } else if (sameUrl) {
+    goBtn.textContent = "Download attempted · change URL to start again";
+  } else {
+    goBtn.textContent = "Download";
+  }
 }
 
-function setState(status, percent, log, error, filename, size) {
-  document.getElementById("progressInner").style.width = percent + "%";
-  document.getElementById("percentText").textContent = Math.round(percent) + "%";
+goBtn.addEventListener("click", startDownload);
+urlInput.addEventListener("input", updateButton);
+urlInput.addEventListener("keydown", e => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    startDownload();
+  }
+});
+
+async function startDownload() {
+  const url = urlInput.value.trim();
+  // Guard the action itself as well as the button (including Enter/double clicks).
+  if (active || !url || url === submittedUrl) return;
+  submittedUrl = url;
+  active = true;
+  completedAt = null;
+  clearInterval(completionTimer);
+  clearTimeout(pollTimer);
+  displayedPercent = 0;
+  updateButton();
+  videoTitle.hidden = false;
+  videoTitle.textContent = "Fetching video title…";
+  videoTitle.classList.add("pending");
+  document.getElementById("statusBlock").style.display = "block";
+  setState({status: "starting"});
+
+  try {
+    const response = await fetch("/api/download", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        url, mode,
+        quality: qualitySelect.value,
+        subs: mode === "video" ? subsCheckbox.checked : false
+      })
+    });
+    const data = await response.json();
+    if (!response.ok || data.error || !data.id) {
+      throw new Error(data.error || "Couldn't start the download.");
+    }
+    pollFailCount = 0;
+    stalledSince = Date.now();
+    poll(data.id);
+  } catch (err) {
+    setState({status: "error", error: String(err), log: [String(err)]});
+    finishAttempt();
+  }
+}
+
+async function poll(id) {
+  try {
+    const response = await fetch("/api/status?id=" + encodeURIComponent(id));
+    if (!response.ok) throw new Error("Status request failed");
+    const job = await response.json();
+    pollFailCount = 0;
+    if (job.status !== "starting") stalledSince = Date.now();
+    if (job.status === "starting" && Date.now() - stalledSince > 15000) {
+      job.log = (job.log || []).concat([
+        "Still starting — waiting for video information or browser cookie access."
+      ]);
+    }
+    setState(job);
+    if (job.status === "done" || job.status === "error") {
+      finishAttempt(job);
+      return;
+    }
+  } catch (err) {
+    pollFailCount += 1;
+    if (pollFailCount >= 3) {
+      setState({status: "error", error:
+        "Lost connection to the server. Try relaunching 'Start YouTube Downloader.command'."});
+      finishAttempt();
+      return;
+    }
+  }
+  // Schedule after the response so slow requests cannot overlap or arrive out of order.
+  pollTimer = setTimeout(() => poll(id), 800);
+}
+
+function setState(job) {
+  const {status, log, error, filename, size, title, phase} = job;
+  const percent = Number(job.percent) || 0;
+  displayedPercent = status === "done" ? 100 :
+    Math.max(displayedPercent, Math.max(0, Math.min(99, percent)));
+  document.getElementById("progressInner").style.width = displayedPercent + "%";
+  document.getElementById("progressBar").setAttribute("aria-valuenow", Math.round(displayedPercent));
+  document.getElementById("percentText").textContent = Math.floor(displayedPercent) + "%";
+  if (title) {
+    videoTitle.textContent = title;
+    videoTitle.classList.remove("pending");
+  } else if ((status === "error" || status === "done") && videoTitle.classList.contains("pending")) {
+    videoTitle.textContent = filename || "Video title unavailable";
+  }
   const stateEl = document.getElementById("stateText");
   stateEl.classList.remove("done", "error");
   if (status === "done") {
@@ -401,20 +453,24 @@ function setState(status, percent, log, error, filename, size) {
   } else if (status === "error") {
     stateEl.textContent = "Error: " + (error || "something went wrong");
     stateEl.classList.add("error");
+  } else if (phase === "finishing") {
+    stateEl.textContent = "Finishing file…";
   } else if (status === "running") {
     stateEl.textContent = "Downloading…";
   } else {
     stateEl.textContent = "Starting…";
   }
   document.getElementById("logBox").textContent = (log || []).join("\n");
-  const sizeEl = document.getElementById("sizeText");
-  sizeEl.textContent = size ? "Total size: " + size : "";
+  document.getElementById("sizeText").textContent = size ? "Total size: " + size : "";
 }
 
-function resetBtn() {
-  const btn = document.getElementById("goBtn");
-  btn.disabled = false;
-  btn.textContent = "Download";
+function finishAttempt(job = {}) {
+  active = false;
+  if (job.status === "done") {
+    completedAt = job.completed_at ? job.completed_at * 1000 : Date.now();
+    completionTimer = setInterval(updateButton, 1000);
+  }
+  updateButton();
 }
 </script>
 </body>

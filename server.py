@@ -169,9 +169,9 @@ def have_cookie_file():
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 
-PERCENT_RE = re.compile(r"\[download\]\s+([\d.]+)%")
 DEST_RE = re.compile(r"(?:Destination|Merging formats into):?\s*\"?([^\"\n]+)\"?$")
-SIZE_RE = re.compile(r"\[download\]\s+[\d.]+%\s+of\s+~?\s*([\d.]+\s?\S+?)(?:\s+at\s|\s+in\s|\s*$)")
+META_PREFIX = "__VID_DL_META__"
+PROGRESS_PREFIX = "__VID_DL_PROGRESS__"
 
 # Default max resolution for video downloads when the user doesn't pick one.
 DEFAULT_QUALITY = "720"
@@ -180,6 +180,18 @@ VALID_QUALITIES = {"best", "2160", "1440", "1080", "720", "480"}
 
 def build_command(url, mode, quality=DEFAULT_QUALITY, subs=False):
     base = [sys.executable, "-m", "yt_dlp", "--newline", "--no-playlist"]
+    # JSON keeps titles safe and separates each selected media stream from
+    # subtitle downloads. Explicit flags prevent --print from silencing progress.
+    base += [
+        "--no-simulate", "--no-quiet", "--progress",
+        "--print", 'before_dl:' + META_PREFIX +
+        '{"title":%(title|null)j,"format_id":%(format_id|null)j,'
+        '"filesize":%(filesize|0)j,"filesize_approx":%(filesize_approx|0)j,'
+        '"formats":%(requested_formats.:.{format_id,filesize,filesize_approx}|null)j}',
+        "--progress-template", 'download:' + PROGRESS_PREFIX +
+        '{"format_id":%(info.format_id|null)j,"progress":'
+        '%(progress.{status,downloaded_bytes,total_bytes,total_bytes_estimate})j}',
+    ]
     if JS_RUNTIME:
         # --remote-components fetches yt-dlp's challenge solver script, which
         # the runtime needs to answer YouTube's "n challenge". Without it the
@@ -291,6 +303,63 @@ def cookies_look_stale(log):
             or "cookies are no longer valid" in text)
 
 
+def positive_number(value):
+    return value if isinstance(value, (int, float)) and value > 0 else 0
+
+
+class DownloadProgress:
+    """Combine selected video/audio streams; never rewind or finish early."""
+
+    def __init__(self, job):
+        self.job = job
+        self.streams = {}
+
+    def consume(self, line):
+        if not line.startswith((META_PREFIX, PROGRESS_PREFIX)):
+            return False
+        prefix = META_PREFIX if line.startswith(META_PREFIX) else PROGRESS_PREFIX
+        try:
+            data = json.loads(line[len(prefix):])
+            if prefix == META_PREFIX:
+                self.job["title"] = data.get("title")
+                formats = data.get("formats")
+                if not isinstance(formats, list) or not formats:
+                    formats = [data]
+                sizes = [positive_number(f.get("filesize")) or
+                         positive_number(f.get("filesize_approx")) for f in formats]
+                # Fixed weights prevent changing estimates from moving the bar
+                # backwards. When sizes are unknown, give each stream a share.
+                weighted = all(sizes)
+                self.streams = {
+                    str(f["format_id"]): {
+                        "weight": size if weighted else 1,
+                        "size": size, "fraction": 0,
+                    }
+                    for f, size in zip(formats, sizes)
+                }
+                if weighted:
+                    self.job["size"] = f"{sum(sizes) / 1024 / 1024:.1f} MiB (estimated)"
+                return True
+            stream = self.streams.get(str(data.get("format_id")))
+            if stream is None:
+                return True  # Subtitles or other ancillary files.
+            progress = data["progress"]
+            total = (positive_number(progress.get("total_bytes")) or
+                     positive_number(progress.get("total_bytes_estimate")) or stream["size"])
+            downloaded = positive_number(progress.get("downloaded_bytes"))
+            fraction = 1 if progress.get("status") == "finished" else (
+                min(downloaded / total, 1) if total else 0)
+            stream["fraction"] = max(stream["fraction"], fraction)
+            overall = sum(s["weight"] * s["fraction"] for s in self.streams.values())
+            overall /= sum(s["weight"] for s in self.streams.values())
+            self.job["percent"] = max(self.job["percent"], min(99, overall * 99))
+            if all(s["fraction"] == 1 for s in self.streams.values()):
+                self.job["phase"] = "finishing"
+        except (ValueError, TypeError, KeyError, AttributeError):
+            pass  # A malformed progress event must not fail the download.
+        return True
+
+
 def run_ytdlp(job, cmd):
     """Run yt-dlp, streaming progress into `job`. Returns the exit code."""
     proc = subprocess.Popen(
@@ -298,18 +367,15 @@ def run_ytdlp(job, cmd):
         text=True, bufsize=1, cwd=DEFAULT_OUTPUT_DIR,
     )
     job["pid"] = proc.pid
+    progress = DownloadProgress(job)
     for line in proc.stdout:
         line = line.rstrip("\n")
         if not line:
             continue
+        if progress.consume(line):
+            continue
         job["log"].append(line)
         job["log"] = job["log"][-80:]
-        m = PERCENT_RE.search(line)
-        if m:
-            job["percent"] = float(m.group(1))
-        s = SIZE_RE.search(line)
-        if s:
-            job["size"] = s.group(1).strip()
         d = DEST_RE.search(line)
         if d:
             job["filename"] = os.path.basename(d.group(1))
@@ -351,12 +417,13 @@ def run_job(job_id, url, mode, quality=DEFAULT_QUALITY, subs=False):
                 "(Saved cookies were rejected - refreshing them from "
                 f"{COOKIE_BROWSER.title()}. macOS may ask for your password.)"
             )
-            job["percent"] = 0
+            job["phase"] = "downloading"
             if export_cookies():
                 rc = run_ytdlp(job, build_command(url, mode, quality, subs))
         if rc == 0:
-            job["status"] = "done"
             job["percent"] = 100
+            job["completed_at"] = time.time()
+            job["status"] = "done"
         else:
             job["status"] = "error"
             job["error"] = explain_failure(job["log"])
@@ -393,6 +460,14 @@ class Handler(BaseHTTPRequestHandler):
                 body = b"<h1>index.html missing</h1>"
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif parsed.path == "/favicon.svg":
+            with open(os.path.join(SCRIPT_DIR, "favicon.svg"), "rb") as f:
+                body = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/svg+xml")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -450,6 +525,7 @@ class Handler(BaseHTTPRequestHandler):
                     "id": job_id, "url": url, "mode": mode, "quality": quality,
                     "subs": subs, "status": "starting", "percent": 0, "size": None,
                     "log": [], "filename": None, "error": None,
+                    "title": None, "completed_at": None, "phase": "downloading",
                 }
             t = threading.Thread(target=run_job, args=(job_id, url, mode, quality, subs), daemon=True)
             t.start()

@@ -15,7 +15,9 @@ This repository does **not** include or redistribute yt-dlp itself. It is downlo
 - Video (MP4) or audio-only (MP3) downloads
 - Quality picker: Best, 4K, 2K, 1080p (default), 720p, 480p
 - Optional English subtitles (`.srt`), with automatic fallback to auto-generated captions if no human-made ones exist
-- Live progress bar with total file size
+- One overall progress bar across video/audio streams, reaching 100% after processing finishes
+- Video title beneath the Download button and an elapsed timer after completion
+- Download stays disabled for the submitted URL; change the URL to start another download
 - Plain browser UI — no command line typing after setup
 - Checks for and installs yt-dlp updates automatically on every launch
 
